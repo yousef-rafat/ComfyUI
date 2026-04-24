@@ -146,6 +146,39 @@ class ImageFromBatch(IO.ComfyNode):
         batch_index = min(s_in.shape[0] - 1, batch_index)
         length = min(s_in.shape[0] - batch_index, length)
         s = s_in[batch_index:batch_index + length].clone()
+        source_image_sizes = getattr(s_in, "source_image_sizes", None)
+        source_image_samples = getattr(s_in, "source_image_samples", None)
+        crop_mode = getattr(s_in, "source_restore_crop_mode", None)
+        preprocess_image_sizes = getattr(s_in, "preprocess_image_sizes", None)
+        selected_crop_modes = None
+        if isinstance(crop_mode, list):
+            selected_crop_modes = crop_mode[batch_index:batch_index + length]
+            crop_mode = selected_crop_modes[0] if selected_crop_modes and all(mode == selected_crop_modes[0] for mode in selected_crop_modes) else None
+        if source_image_sizes is not None:
+            selected_source_sizes = [tuple(size) for size in source_image_sizes[batch_index:batch_index + length]]
+            if crop_mode == "none":
+                unique_source_sizes = {tuple(size) for size in selected_source_sizes}
+                if len(unique_source_sizes) == 1:
+                    source_height, source_width = selected_source_sizes[0]
+                    if s.shape[1] != source_height or s.shape[2] != source_width:
+                        s = comfy.utils.common_upscale(s.movedim(-1, 1), source_width, source_height, "bilinear", "disabled").movedim(1, -1)
+            s.source_image_sizes = selected_source_sizes
+            if source_image_samples is not None and len(source_image_samples) == s_in.shape[0]:
+                s.source_image_samples = list(source_image_samples[batch_index:batch_index + length])
+            if selected_crop_modes is not None:
+                s.source_restore_crop_mode = selected_crop_modes if crop_mode is None else crop_mode
+            elif crop_mode is not None:
+                s.source_restore_crop_mode = crop_mode
+            if preprocess_image_sizes is not None:
+                selected_preprocess_sizes = [
+                    tuple(size) if size is not None else None
+                    for size in preprocess_image_sizes[batch_index:batch_index + length]
+                ]
+                if any(size is not None for size in selected_preprocess_sizes):
+                    if all(size is not None for size in selected_preprocess_sizes):
+                        s.preprocess_image_sizes = [tuple(size) for size in selected_preprocess_sizes]
+                    else:
+                        s.preprocess_image_sizes = selected_preprocess_sizes
         return IO.NodeOutput(s)
 
     frombatch = execute  # TODO: remove

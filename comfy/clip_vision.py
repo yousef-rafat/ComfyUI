@@ -2,6 +2,7 @@ from .utils import load_torch_file, transformers_convert, state_dict_prefix_repl
 import os
 import json
 import logging
+import torch
 
 import comfy.ops
 import comfy.model_patcher
@@ -59,7 +60,29 @@ class ClipVisionModel():
 
     def encode_image(self, image, crop=True):
         comfy.model_management.load_model_gpu(self.patcher)
-        if self.model_type == "siglip2_vision_model":
+        source_image_sizes = getattr(image, "source_image_sizes", None)
+        if source_image_sizes is None or len(source_image_sizes) != image.shape[0]:
+            source_image_size = tuple(image.shape[1:3])
+            source_image_sizes = [source_image_size] * image.shape[0]
+        else:
+            source_image_sizes = [tuple(size) for size in source_image_sizes]
+        source_image_samples = getattr(image, "source_image_samples", None)
+        if self.model_type == "birefnet" and source_image_samples is not None and len(source_image_samples) == image.shape[0]:
+            source_image_sizes = [tuple(sample.shape[1:3]) for sample in source_image_samples]
+            processed = []
+            for sample in source_image_samples:
+                sample = sample.to(self.load_device)
+                processed.append(
+                    comfy.clip_model.clip_preprocess(
+                        sample,
+                        size=self.image_size,
+                        mean=self.image_mean,
+                        std=self.image_std,
+                        crop=crop,
+                    ).float()
+                )
+            pixel_values = torch.cat(processed, dim=0)
+        elif self.model_type == "siglip2_vision_model":
             pixel_values = comfy.clip_model.siglip2_preprocess(image.to(self.load_device), size=self.image_size, patch_size=self.config.get("patch_size", 16), num_patches=self.config.get("num_patches", 256), mean=self.image_mean, std=self.image_std, crop=crop).float()
         else:
             pixel_values = comfy.clip_model.clip_preprocess(image.to(self.load_device), size=self.image_size, mean=self.image_mean, std=self.image_std, crop=crop).float()
@@ -69,6 +92,10 @@ class ClipVisionModel():
         outputs["last_hidden_state"] = out[0].to(comfy.model_management.intermediate_device())
         outputs["image_embeds"] = out[2].to(comfy.model_management.intermediate_device())
         outputs["image_sizes"] = [pixel_values.shape[1:]] * pixel_values.shape[0]
+        outputs["preprocess_image_sizes"] = [tuple(pixel_values.shape[-2:])] * pixel_values.shape[0]
+        outputs["source_image_sizes"] = source_image_sizes
+        outputs["clip_vision_model_type"] = self.model_type
+        outputs["source_restore_crop_mode"] = "center" if crop else "none"
         if self.return_all_hidden_states:
             all_hs = out[1].to(comfy.model_management.intermediate_device())
             outputs["penultimate_hidden_states"] = all_hs[:, -2]

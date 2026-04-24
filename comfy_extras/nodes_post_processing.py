@@ -509,13 +509,70 @@ class ResizeImageMaskNode(io.ComfyNode):
 def batch_images(images: list[torch.Tensor]) -> torch.Tensor | None:
     if len(images) == 0:
         return None
+    source_image_sizes: list[tuple[int, int]] = []
+    preprocess_image_sizes: list[tuple[int, int] | None] = []
+    has_any_preprocess_image_sizes = False
+    source_restore_crop_mode: str | None = None
+    preserve_source_restore_crop_mode = True
+    source_restore_crop_modes: list[str | None] = []
+    has_existing_source_samples = any(
+        (getattr(image, "source_image_samples", None) is not None)
+        and len(getattr(image, "source_image_samples")) == image.shape[0]
+        for image in images
+    )
+    preserve_source_samples = len({tuple(image.shape[1:3]) for image in images}) > 1 or has_existing_source_samples
+    source_image_samples: list[torch.Tensor] | None = [] if preserve_source_samples else None
+    pending_fallback_source_samples: list[torch.Tensor] = []
     # first, get the max channels count
     max_channels = max(image.shape[-1] for image in images)
     # then, pad all images to have the same channels count
     padded_images: list[torch.Tensor] = []
     for image in images:
+        image_source_sizes = getattr(image, "source_image_sizes", None)
+        if image_source_sizes is None or len(image_source_sizes) != image.shape[0]:
+            source_image_sizes.extend([tuple(image.shape[1:3])] * image.shape[0])
+        else:
+            source_image_sizes.extend([tuple(size) for size in image_source_sizes])
+        image_preprocess_sizes = getattr(image, "preprocess_image_sizes", None)
+        has_valid_preprocess_sizes = image_preprocess_sizes is not None and len(image_preprocess_sizes) == image.shape[0]
+        if has_valid_preprocess_sizes:
+            normalized_preprocess_sizes = [tuple(size) if size is not None else None for size in image_preprocess_sizes]
+            if any(size is not None for size in normalized_preprocess_sizes):
+                has_any_preprocess_image_sizes = True
+            preprocess_image_sizes.extend(normalized_preprocess_sizes)
+        else:
+            preprocess_image_sizes.extend([None] * image.shape[0])
+        image_crop_mode = getattr(image, "source_restore_crop_mode", None)
+        if isinstance(image_crop_mode, list) and len(image_crop_mode) == image.shape[0]:
+            image_crop_modes = list(image_crop_mode)
+            uniform_image_crop_mode = image_crop_modes[0] if image_crop_modes and all(mode == image_crop_modes[0] for mode in image_crop_modes) else None
+        else:
+            image_crop_modes = [image_crop_mode] * image.shape[0]
+            uniform_image_crop_mode = image_crop_mode
+        source_restore_crop_modes.extend(image_crop_modes)
+        if not preserve_source_restore_crop_mode or uniform_image_crop_mode is None:
+            preserve_source_restore_crop_mode = False
+            source_restore_crop_mode = None
+        elif source_restore_crop_mode is None:
+            source_restore_crop_mode = uniform_image_crop_mode
+        elif source_restore_crop_mode != uniform_image_crop_mode:
+            preserve_source_restore_crop_mode = False
+            source_restore_crop_mode = None
+        image_source_samples = getattr(image, "source_image_samples", None)
+        has_valid_source_samples = image_source_samples is not None and len(image_source_samples) == image.shape[0]
+        if source_image_samples is not None:
+            image_fallback_source_samples = [image[index:index + 1] for index in range(image.shape[0])]
+            if has_valid_source_samples:
+                if pending_fallback_source_samples:
+                    source_image_samples.extend(pending_fallback_source_samples)
+                    pending_fallback_source_samples = []
+                source_image_samples.extend(image_source_samples)
+            elif has_existing_source_samples:
+                pending_fallback_source_samples.extend(image_fallback_source_samples)
+            else:
+                source_image_samples.extend(image_fallback_source_samples)
         if image.shape[-1] < max_channels:
-            padded_images.append(torch.nn.functional.pad(image, (0,1), mode='constant', value=1.0))
+            padded_images.append(torch.nn.functional.pad(image, (0, max_channels - image.shape[-1]), mode='constant', value=1.0))
         else:
             padded_images.append(image)
     # resize all images to be the same size as the first image
@@ -527,7 +584,19 @@ def batch_images(images: list[torch.Tensor]) -> torch.Tensor | None:
         else:
             resized_images.append(image)
     # batch the images in the format [b, h, w, c]
-    return torch.cat(resized_images, dim=0)
+    batched = torch.cat(resized_images, dim=0)
+    batched.source_image_sizes = source_image_sizes
+    if source_image_samples is not None:
+        if pending_fallback_source_samples:
+            source_image_samples.extend(pending_fallback_source_samples)
+        batched.source_image_samples = source_image_samples
+    if preserve_source_restore_crop_mode and source_restore_crop_mode is not None:
+        batched.source_restore_crop_mode = source_restore_crop_mode
+    elif any(mode is not None for mode in source_restore_crop_modes):
+        batched.source_restore_crop_mode = source_restore_crop_modes
+    if has_any_preprocess_image_sizes:
+        batched.preprocess_image_sizes = preprocess_image_sizes
+    return batched
 
 def batch_masks(masks: list[torch.Tensor]) -> torch.Tensor | None:
     if len(masks) == 0:
